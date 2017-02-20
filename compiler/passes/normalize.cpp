@@ -94,13 +94,13 @@ static void init_typed_var(VarSymbol* var,
                            Expr*      insert,
                            VarSymbol* constTemp);
 
+static bool isModuleNoinit(VarSymbol* var, Expr* init);
+
 static void init_noinit_var(VarSymbol* var,
                             Expr*      type,
                             Expr*      init,
                             Expr*      insert,
                             VarSymbol* constTemp);
-
-static bool moduleHonorsNoinit(Symbol* var, Expr* init);
 
 static void updateVariableAutoDestroy(DefExpr* defExpr);
 
@@ -1420,42 +1420,6 @@ static void init_typed_var(VarSymbol* var,
   }
 }
 
-static void init_typed_var(VarSymbol* var,
-                           Expr*      type,
-                           Expr*      init,
-                           Expr*      insert,
-                           VarSymbol* constTemp) {
-  VarSymbol* typeTemp = newTemp("type_tmp");
-  DefExpr*   typeDefn = new DefExpr(typeTemp);
-  CallExpr*  initCall = new CallExpr(PRIM_INIT, type->remove());
-  CallExpr*  initMove = new CallExpr(PRIM_MOVE, typeTemp,  initCall);
-  CallExpr*  assign   = new CallExpr("=",       typeTemp,  init->remove());
-  CallExpr*  varMove  = new CallExpr(PRIM_MOVE, constTemp, typeTemp);
-
-  insert->insertAfter(typeDefn);
-  typeDefn->insertAfter(initMove);
-  initMove->insertAfter(assign);
-  assign->insertAfter(varMove);
-}
-
-static void init_noinit_var(VarSymbol* var,
-                            Expr*      type,
-                            Expr*      init,
-                            Expr*      insert,
-                            VarSymbol* constTemp) {
-  init->remove();
-
-  if (fUseNoinit == true || moduleHonorsNoinit(var, init) == true) {
-    CallExpr* noinitCall = new CallExpr(PRIM_NO_INIT, type->remove());
-
-    insert->insertAfter(new CallExpr(PRIM_MOVE, var, noinitCall));
-
-  } else {
-    // Ignore no-init expression and fall back on default init
-    init_typed_var(var, type, insert, constTemp);
-  }
-}
-
 /************************************* | **************************************
 *                                                                             *
 * normalizeVariableDefinition removes DefExpr::exprType and DefExpr::init     *
@@ -1466,8 +1430,6 @@ static void init_noinit_var(VarSymbol* var,
 
 static void normVarTypeInference(DefExpr* expr);
 static void normVarTypeWoutInit(DefExpr* expr);
-static void normVarTypeWithInit(DefExpr* expr);
-static void normVarNoinit(DefExpr* defExpr);
 
 static void normalizeVariableDefinition(DefExpr* defExpr) {
   SET_LINENO(defExpr);
@@ -1480,27 +1442,57 @@ static void normalizeVariableDefinition(DefExpr* defExpr) {
   if (var->hasFlag(FLAG_REF_VAR)) {
     normRefVar(defExpr);
 
-  } else if (type == NULL && init != NULL) {
-    normVarTypeInference(defExpr);
-
   } else if (type != NULL && init == NULL) {
     normVarTypeWoutInit(defExpr);
 
-  } else if (type != NULL && init != NULL) {
-    if (var->hasFlag(FLAG_PARAM) == true) {
+  } else if (type == NULL && init != NULL) {
+    normVarTypeInference(defExpr);
+
+  } else {
+    VarSymbol* constTemp = var;
+
+    if (var->hasFlag(FLAG_NO_COPY) == true) {
+      // If a type expression is set, normalize would normally
+      // use defaultOf/assignment anyway. As of 9-21-2016
+      // setting FLAG_NO_COPY and having a type leads to some
+      // unresolved type expression hanging around in the AST.
+
+      // Noakes 2017/02/19
+      //   Behavior locked in by futures in test/trivial/sungeun/pragmas
+
+      INT_ASSERT(init != NULL);
+      INT_ASSERT(type == NULL);
+
+      defExpr->insertAfter(new CallExpr(PRIM_MOVE, var, init->remove()));
+      return;
+
+    } else {
+      if (var->hasFlag(FLAG_CONST)  ==  true &&
+          var->hasFlag(FLAG_EXTERN) == false) {
+        constTemp = newTemp("const_tmp");
+
+        defExpr->insertBefore(new DefExpr(constTemp));
+        defExpr->insertAfter(new CallExpr(PRIM_MOVE, var, constTemp));
+      }
+    }
+
+    if        (type == NULL && init != NULL) {
+      INT_ASSERT(false);
+
+    } else if (type != NULL && init == NULL) {
+      INT_ASSERT(false);
+
+    } else if (var->hasFlag(FLAG_PARAM) == true) {
       CallExpr* cast = new CallExpr("_cast", type->remove(), init->remove());
 
       defExpr->insertAfter(new CallExpr(PRIM_MOVE, var, cast));
 
     } else if (init->isNoInitExpr() == true) {
-      normVarNoinit(defExpr);
+      init_noinit_var(var, type, init, defExpr, constTemp);
 
     } else {
-      normVarTypeWithInit(defExpr);
+      init_typed_var(var, type, init, defExpr, constTemp);
     }
-
-  } else {
-    INT_ASSERT(false);
   }
 }
 
@@ -1548,10 +1540,12 @@ static void normRefVar(DefExpr* defExpr) {
                                     new CallExpr(PRIM_ADDR_OF, varLocation)));
 }
 
+
+
 //
 // const <name> = <value>;
-// param <name> = <value>;
 // var   <name> = <value>;
+// param <name> = <value>;
 //
 // The type of <name> will be inferred from the type of <value>
 //
@@ -1585,8 +1579,8 @@ static void normVarTypeInference(DefExpr* defExpr) {
 
 //
 // const <name> : <type>;
-// param <name> : <type>;
 // var   <name> : <type>;
+// param <name> : <type>;
 //
 // The type is explicit and the initial value is implied by the type
 //
@@ -1651,43 +1645,28 @@ static void normVarTypeWoutInit(DefExpr* defExpr) {
   }
 }
 
-static void normVarTypeWithInit(DefExpr* defExpr) {
-  Symbol*    var      = defExpr->sym;
-  Expr*      type     = defExpr->exprType->remove();
-  Expr*      init     = defExpr->init->remove();
-
+static void init_typed_var(VarSymbol* var,
+                           Expr*      type,
+                           Expr*      init,
+                           Expr*      insert,
+                           VarSymbol* constTemp) {
   VarSymbol* typeTemp = newTemp("type_tmp");
   DefExpr*   typeDefn = new DefExpr(typeTemp);
-  CallExpr*  initCall = new CallExpr(PRIM_INIT, type);
+  CallExpr*  initCall = new CallExpr(PRIM_INIT, type->remove());
   CallExpr*  initMove = new CallExpr(PRIM_MOVE, typeTemp,  initCall);
-  CallExpr*  assign   = new CallExpr("=",       typeTemp,  init);
+  CallExpr*  assign   = new CallExpr("=",       typeTemp,  init->remove());
+  CallExpr*  varMove  = new CallExpr(PRIM_MOVE, constTemp, typeTemp);
 
-  INT_ASSERT(var->hasFlag(FLAG_NO_COPY) == false);
-
-  if (var->hasFlag(FLAG_CONST) == true) {
-    VarSymbol* tmp     = newTemp("const_tmp");
-    CallExpr*  varMove = new CallExpr(PRIM_MOVE, tmp, typeTemp);
-
-    defExpr->insertBefore(new DefExpr(tmp));
-
-    defExpr->insertAfter(typeDefn);
-    typeDefn->insertAfter(initMove);
-    initMove->insertAfter(assign);
-    assign->insertAfter(varMove);
-    varMove->insertAfter(new CallExpr(PRIM_MOVE, var, tmp));
-
-  } else {
-    defExpr->insertAfter(typeDefn);
-    typeDefn->insertAfter(initMove);
-    initMove->insertAfter(assign);
-    assign->insertAfter(new CallExpr(PRIM_MOVE, var, typeTemp));
-  }
+  insert->insertAfter(typeDefn);
+  typeDefn->insertAfter(initMove);
+  initMove->insertAfter(assign);
+  assign->insertAfter(varMove);
 }
 
 // Internal and Standard modules always honor no-init
 //
 // As a minimum, the complex type appears to rely on this
-static bool moduleHonorsNoinit(Symbol* var, Expr* init) {
+static bool isModuleNoinit(VarSymbol* var, Expr* init) {
   bool isNoinit = init->isNoInitExpr();
   bool retval   = false;
 
@@ -1710,32 +1689,21 @@ static bool moduleHonorsNoinit(Symbol* var, Expr* init) {
   return retval;
 }
 
-static void normVarNoinit(DefExpr* defExpr) {
-  Symbol* var  = defExpr->sym;
-  Expr*   init = defExpr->init;
-
+static void init_noinit_var(VarSymbol* var,
+                            Expr*      type,
+                            Expr*      init,
+                            Expr*      insert,
+                            VarSymbol* constTemp) {
   init->remove();
 
-  if (fUseNoinit == true || moduleHonorsNoinit(var, init) == true) {
-    Expr*      type   = defExpr->exprType;
-    CallExpr*  noinit = new CallExpr(PRIM_NO_INIT, type->remove());
+  if (fUseNoinit == true || isModuleNoinit(var, init) == true) {
+    CallExpr* noinitCall = new CallExpr(PRIM_NO_INIT, type->remove());
 
-    INT_ASSERT(var->hasFlag(FLAG_NO_COPY) == false);
-
-    if (var->hasFlag(FLAG_CONST)  ==  true) {
-      VarSymbol* tmp = newTemp("const_tmp");
-
-      defExpr->insertBefore(new DefExpr(tmp));
-      defExpr->insertAfter(new CallExpr(PRIM_MOVE, var, tmp));
-      defExpr->insertAfter(new CallExpr(PRIM_MOVE, var, noinit));
-
-    } else {
-      defExpr->insertAfter(new CallExpr(PRIM_MOVE, var, noinit));
-    }
+    insert->insertAfter(new CallExpr(PRIM_MOVE, var, noinitCall));
 
   } else {
     // Ignore no-init expression and fall back on default init
-    normVarTypeWoutInit(defExpr);
+    init_typed_var(var, type, insert, constTemp);
   }
 }
 
